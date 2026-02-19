@@ -1,7 +1,8 @@
 import os
-import random
-import subprocess
+import socket
 import time
+import atexit
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -22,6 +23,7 @@ XPATH_BTN = "/html/body/div/div[1]/div/div[2]/form/div[4]/div/input"
 
 PING_TARGETS = ["8.8.8.8", "1.1.1.1", "208.67.222.222"]
 PING_INTERVAL = int(os.getenv("PING_INTERVAL", 5))
+WAIT_TIMEOUT = int(os.getenv("WAIT_TIMEOUT", 8))
 BAR_WIDTH = 30
 
 # --- Couleurs ANSI ---
@@ -45,6 +47,21 @@ last_reconnection = None
 current_progress = 0
 logs = []
 
+# WebDriver persistant (créé à la première reconnexion)
+driver = None
+
+
+def _cleanup_driver():
+    global driver
+    try:
+        if driver:
+            driver.quit()
+    except Exception:
+        pass
+
+
+atexit.register(_cleanup_driver)
+
 
 def add_log(level, message, refresh=False):
     now = datetime.now().strftime("%H:%M:%S")
@@ -63,26 +80,33 @@ def add_log(level, message, refresh=False):
         render(current_progress)
 
 
-def ping_host(ip):
+def ping_host(ip, port=53, timeout=1):
+    """Test de connectivite via socket TCP (port 53 = DNS) — bien plus rapide qu'un subprocess ping."""
     start = time.time()
-    result = subprocess.run(
-        ["ping", "-n", "1", "-w", "2000", ip],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    ms = round((time.time() - start) * 1000)
-    if result.returncode == 0:
-        return True, ms
-    return False, ms
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((ip, port))
+        sock.close()
+        ms = round((time.time() - start) * 1000)
+        return ip, True, ms
+    except (socket.timeout, OSError):
+        ms = round((time.time() - start) * 1000)
+        return ip, False, ms
 
 
 def check_connection():
-    ip = random.choice(PING_TARGETS)
-    ok, ms = ping_host(ip)
-    if ok:
-        add_log("ok", f"{GREEN}{ip} OK {DIM}{ms}ms{RESET}", refresh=True)
-        return True
-    add_log("fail", f"{RED}{ip} timeout {DIM}{ms}ms{RESET}", refresh=True)
+    """Teste tous les hotes en parallele — retourne True des qu'un seul repond."""
+    with ThreadPoolExecutor(max_workers=len(PING_TARGETS)) as pool:
+        results = list(pool.map(ping_host, PING_TARGETS))
+
+    for ip, ok, ms in results:
+        if ok:
+            add_log("ok", f"{GREEN}{ip} OK {DIM}{ms}ms{RESET}", refresh=True)
+            return True
+
+    fastest = min(results, key=lambda r: r[2])
+    add_log("fail", f"{RED}Tous timeout (meilleur: {fastest[0]} {DIM}{fastest[2]}ms){RESET}", refresh=True)
     return False
 
 
@@ -141,41 +165,51 @@ def render(elapsed):
 
 def login_alcasar():
     global connected, reconnections, last_reconnection
-
     add_log("warn", f"{YELLOW}Aucun hote joignable{RESET}", refresh=True)
     connected = False
     add_log("warn", f"{YELLOW}Reconnexion ALCASAR...{RESET}", refresh=True)
 
-    options = webdriver.FirefoxOptions()
-    options.add_argument("--headless")
-
-    add_log("step", "Ouverture de Firefox", refresh=True)
-    driver = webdriver.Firefox(options=options)
+    global driver
+    # Création du driver à la première utilisation et réutilisation ensuite
+    if driver is None:
+        options = webdriver.FirefoxOptions()
+        options.add_argument("--headless")
+        add_log("step", "Ouverture de Firefox (persistant)", refresh=True)
+        driver = webdriver.Firefox(options=options)
+        # réduire les temps d'attente généraux
+        try:
+            driver.set_page_load_timeout(15)
+        except Exception:
+            pass
 
     try:
         add_log("step", "Chargement du portail", refresh=True)
         driver.get("http://alcasar.lan/intercept.php")
 
-        wait = WebDriverWait(driver, 30)
+        wait = WebDriverWait(driver, WAIT_TIMEOUT)
 
         add_log("step", "Saisie de l'identifiant", refresh=True)
         champ_id = wait.until(EC.element_to_be_clickable((By.XPATH, XPATH_ID)))
-        champ_id.click()
-        time.sleep(0.5)
         champ_id.clear()
         champ_id.send_keys(USERNAME)
 
         add_log("step", "Saisie du mot de passe", refresh=True)
         champ_mdp = wait.until(EC.element_to_be_clickable((By.XPATH, XPATH_MDP)))
-        champ_mdp.click()
-        time.sleep(0.5)
         champ_mdp.clear()
         champ_mdp.send_keys(PASSWORD)
 
         add_log("step", "Clic sur Connexion", refresh=True)
         bouton = wait.until(EC.element_to_be_clickable((By.XPATH, XPATH_BTN)))
         bouton.click()
-        time.sleep(3)
+
+        # Attendre que l'URL change (indique souvent que la connexion a réussie)
+        try:
+            WebDriverWait(driver, WAIT_TIMEOUT).until(
+                lambda d: "intercept.php" not in d.current_url
+            )
+        except Exception:
+            # fallback: courte pause minimale
+            time.sleep(1)
 
         reconnections += 1
         last_reconnection = datetime.now().strftime("%H:%M:%S")
@@ -183,9 +217,12 @@ def login_alcasar():
         add_log("ok", f"{GREEN}{BOLD}Reconnexion reussie !{RESET}", refresh=True)
     except Exception as e:
         add_log("fail", f"{RED}Echec : {e}{RESET}", refresh=True)
-    finally:
-        add_log("step", "Fermeture de Firefox", refresh=True)
-        driver.quit()
+        # Si le driver est dans un état instable, le fermer pour recréation
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        driver = None
 
 
 def main():
