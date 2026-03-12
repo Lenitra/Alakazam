@@ -1,29 +1,24 @@
 import os
 import socket
+import ssl
 import time
-import atexit
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from html.parser import HTMLParser
 
 from dotenv import load_dotenv
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 load_dotenv()
 
 # --- Configuration ---
 USERNAME = os.getenv("ALCASAR_USER")
 PASSWORD = os.getenv("ALCASAR_PASS")
-
-XPATH_ID = "/html/body/div/div[1]/div/div[2]/form/div[3]/div[2]/div[1]/div[2]/input"
-XPATH_MDP = "/html/body/div/div[1]/div/div[2]/form/div[3]/div[2]/div[2]/div[2]/input"
-XPATH_BTN = "/html/body/div/div[1]/div/div[2]/form/div[4]/div/input"
+PORTAL_URL = os.getenv("PORTAL_URL", "http://alcasar.lan/intercept.php")
 
 PING_TARGETS = ["8.8.8.8", "1.1.1.1", "208.67.222.222"]
 PING_INTERVAL = int(os.getenv("PING_INTERVAL", 5))
-WAIT_TIMEOUT = int(os.getenv("WAIT_TIMEOUT", 8))
 BAR_WIDTH = 30
 
 # --- Couleurs ANSI ---
@@ -47,20 +42,37 @@ last_reconnection = None
 current_progress = 0
 logs = []
 
-# WebDriver persistant (créé à la première reconnexion)
-driver = None
+# SSL context pour accepter les certificats auto-signes (courant sur ALCASAR)
+_ssl_ctx = ssl.create_default_context()
+_ssl_ctx.check_hostname = False
+_ssl_ctx.verify_mode = ssl.CERT_NONE
 
 
-def _cleanup_driver():
-    global driver
-    try:
-        if driver:
-            driver.quit()
-    except Exception:
-        pass
+# --- Parseur de formulaire HTML ---
+class _FormParser(HTMLParser):
+    """Extrait l'action et les champs du premier <form> trouve."""
 
+    def __init__(self):
+        super().__init__()
+        self.action = ""
+        self.method = "GET"
+        self.inputs = []  # [(name, value, type), ...]
+        self._in_form = False
 
-atexit.register(_cleanup_driver)
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "form":
+            self._in_form = True
+            self.action = a.get("action", "")
+            self.method = a.get("method", "GET").upper()
+        elif tag == "input" and self._in_form:
+            name = a.get("name", "")
+            if name:
+                self.inputs.append((name, a.get("value", ""), a.get("type", "text").lower()))
+
+    def handle_endtag(self, tag):
+        if tag == "form":
+            self._in_form = False
 
 
 def add_log(level, message, refresh=False):
@@ -81,7 +93,7 @@ def add_log(level, message, refresh=False):
 
 
 def ping_host(ip, port=53, timeout=1):
-    """Test de connectivite via socket TCP (port 53 = DNS) — bien plus rapide qu'un subprocess ping."""
+    """Test de connectivite via socket TCP (port 53 = DNS)."""
     start = time.time()
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -165,64 +177,59 @@ def render(elapsed):
 
 def login_alcasar():
     global connected, reconnections, last_reconnection
+
     add_log("warn", f"{YELLOW}Aucun hote joignable{RESET}", refresh=True)
     connected = False
     add_log("warn", f"{YELLOW}Reconnexion ALCASAR...{RESET}", refresh=True)
 
-    global driver
-    # Création du driver à la première utilisation et réutilisation ensuite
-    if driver is None:
-        options = webdriver.FirefoxOptions()
-        options.add_argument("--headless")
-        add_log("step", "Ouverture de Firefox (persistant)", refresh=True)
-        driver = webdriver.Firefox(options=options)
-        # réduire les temps d'attente généraux
-        try:
-            driver.set_page_load_timeout(15)
-        except Exception:
-            pass
-
     try:
+        # 1. Charger la page du portail
         add_log("step", "Chargement du portail", refresh=True)
-        driver.get("http://alcasar.lan/intercept.php")
+        req = urllib.request.Request(PORTAL_URL)
+        resp = urllib.request.urlopen(req, timeout=10, context=_ssl_ctx)
+        html = resp.read().decode("utf-8", errors="replace")
+        base_url = resp.url  # URL finale apres redirection eventuelle
 
-        wait = WebDriverWait(driver, WAIT_TIMEOUT)
+        # 2. Parser le formulaire
+        parser = _FormParser()
+        parser.feed(html)
 
-        add_log("step", "Saisie de l'identifiant", refresh=True)
-        champ_id = wait.until(EC.element_to_be_clickable((By.XPATH, XPATH_ID)))
-        champ_id.clear()
-        champ_id.send_keys(USERNAME)
+        if not parser.inputs:
+            add_log("fail", f"{RED}Aucun formulaire trouve sur le portail{RESET}", refresh=True)
+            return
 
-        add_log("step", "Saisie du mot de passe", refresh=True)
-        champ_mdp = wait.until(EC.element_to_be_clickable((By.XPATH, XPATH_MDP)))
-        champ_mdp.clear()
-        champ_mdp.send_keys(PASSWORD)
+        # 3. Remplir les champs : password par type, username = premier champ texte
+        fields = {}
+        username_filled = False
+        for name, value, input_type in parser.inputs:
+            if input_type == "password":
+                fields[name] = PASSWORD
+            elif input_type in ("text", "email") and not username_filled:
+                fields[name] = USERNAME
+                username_filled = True
+            else:
+                fields[name] = value  # champs hidden, submit, etc.
 
-        add_log("step", "Clic sur Connexion", refresh=True)
-        bouton = wait.until(EC.element_to_be_clickable((By.XPATH, XPATH_BTN)))
-        bouton.click()
+        # 4. Determiner l'URL d'action
+        action = parser.action
+        if action and not action.startswith("http"):
+            action = urllib.parse.urljoin(base_url, action)
+        elif not action:
+            action = base_url
 
-        # Attendre que l'URL change (indique souvent que la connexion a réussie)
-        try:
-            WebDriverWait(driver, WAIT_TIMEOUT).until(
-                lambda d: "intercept.php" not in d.current_url
-            )
-        except Exception:
-            # fallback: courte pause minimale
-            time.sleep(1)
+        # 5. Soumettre le formulaire
+        add_log("step", f"Envoi des identifiants vers {action}", refresh=True)
+        data = urllib.parse.urlencode(fields).encode("utf-8")
+        post_req = urllib.request.Request(action, data=data, method="POST")
+        urllib.request.urlopen(post_req, timeout=10, context=_ssl_ctx)
 
         reconnections += 1
         last_reconnection = datetime.now().strftime("%H:%M:%S")
         connected = True
         add_log("ok", f"{GREEN}{BOLD}Reconnexion reussie !{RESET}", refresh=True)
+
     except Exception as e:
         add_log("fail", f"{RED}Echec : {e}{RESET}", refresh=True)
-        # Si le driver est dans un état instable, le fermer pour recréation
-        try:
-            driver.quit()
-        except Exception:
-            pass
-        driver = None
 
 
 def main():
